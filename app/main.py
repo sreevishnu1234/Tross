@@ -70,7 +70,7 @@ async def session_status():
 
 @app.post("/session/bootstrap")
 async def session_bootstrap(body: BootstrapRequest):
-    ok = await bootstrap_session(body.cookie_header)
+    ok = await bootstrap_session(body.li_at, body.jsessionid)
     if not ok:
         raise HTTPException(
             status_code=401,

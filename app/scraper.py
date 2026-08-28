@@ -192,34 +192,19 @@ async def keep_session_alive() -> None:
     _save_cookies(cookies, _session_path_for(_current_account_index))
 
 
-def _parse_cookie_header(cookie_header: str) -> dict:
-    """Parse a raw `Cookie: a=1; b=2; ...` header value (copied whole from a
-    browser's Network tab) into a plain {name: value} dict with everything
-    intact."""
-    cookies = {}
-    for part in cookie_header.split(";"):
-        part = part.strip()
-        if not part or "=" not in part:
-            continue
-        name, _, value = part.partition("=")
-        cookies[name.strip()] = value.strip()
-    return cookies
-
-
-async def bootstrap_session(cookie_header: str) -> bool:
-    """Accept a manually-obtained full Cookie header (see README — LinkedIn's
+async def bootstrap_session(li_at: str, jsessionid: str) -> bool:
+    """Accept a manually-obtained li_at/JSESSIONID pair (see README — LinkedIn's
     login endpoint blocks non-browser login attempts) and adopt it as the
-    active session if it actually works. Using the *whole* cookie set (not
-    just li_at/JSESSIONID) matters: replaying only a couple of cookies without
-    the rest of the browser's original set looks like a different device
-    reusing a stolen session token to LinkedIn's fraud detection, and gets
-    rejected even when li_at itself is genuinely fresh and valid.
-    Returns whether it was accepted."""
+    active session if it actually works. Returns whether it was accepted.
+
+    NOTE: only these two cookies are sent, not the rest of the browser's
+    original cookie jar (bcookie/bscookie/etc.) — that was previously found to
+    look like a different device reusing a stolen session token to LinkedIn's
+    fraud detection, but was simplified back down to just these two at the
+    account owner's request. See README Known Limitations."""
     global _cookies
 
-    cookies = _parse_cookie_header(cookie_header)
-    if not cookies.get("li_at") or not cookies.get("JSESSIONID"):
-        return False
+    cookies = {"li_at": li_at.strip(), "JSESSIONID": jsessionid.strip()}
 
     if not await _validate_cookies(cookies):
         return False

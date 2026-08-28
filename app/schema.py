@@ -56,7 +56,8 @@ class ErrorResponse(BaseModel):
 
 
 class BootstrapRequest(BaseModel):
-    cookie_header: str
+    li_at: str
+    jsessionid: str
 
 
 class LoginRequest(BaseModel):

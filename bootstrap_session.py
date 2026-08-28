@@ -3,22 +3,15 @@ One-time manual step to give the pure-HTTP API a working session.
 
 LinkedIn's login endpoint fingerprint-blocks non-browser clients (see README),
 so the automated credentials-based login can't reliably clear it. This script
-takes the full Cookie header a normal, manual browser login already produced
-and saves it in the flat format app/scraper.py expects — no browser is
-launched or automated by this script itself.
-
-Copying the *whole* cookie header (not just li_at/JSESSIONID individually)
-matters: replaying only a couple of cookies without the rest of the browser's
-original set looks like a different device reusing a stolen session token to
-LinkedIn's fraud detection, and gets rejected even when li_at itself is
-genuinely fresh and valid.
+takes the li_at/JSESSIONID cookies a normal, manual browser login already
+produced and saves them in the flat format app/scraper.py expects — no
+browser is launched or automated by this script itself.
 
 Usage:
     1. Log into the dummy LinkedIn account in an ordinary browser.
-    2. DevTools -> Network tab -> reload linkedin.com/feed.
-    3. Click any request to linkedin.com -> Headers -> find the "Cookie"
-       request header and copy its entire value.
-    4. Run this script and paste it in when prompted.
+    2. DevTools -> Application -> Cookies -> https://www.linkedin.com
+    3. Copy the values of "li_at" and "JSESSIONID".
+    4. Run this script and paste them in when prompted.
 """
 
 import argparse
@@ -28,7 +21,6 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 from app.config import SESSION_STATE_PATH  # noqa: E402
-from app.scraper import _parse_cookie_header  # noqa: E402
 
 
 def session_path_for(index: int) -> str:
@@ -48,19 +40,17 @@ def main():
     )
     args = parser.parse_args()
 
-    cookie_header = input("Cookie header: ").strip()
-    if not cookie_header:
-        raise SystemExit("The Cookie header value is required.")
+    li_at = input("li_at: ").strip()
+    jsessionid = input("JSESSIONID: ").strip()
 
-    cookies = _parse_cookie_header(cookie_header)
-    if not cookies.get("li_at") or not cookies.get("JSESSIONID"):
-        raise SystemExit("That doesn't look like a full Cookie header — li_at and JSESSIONID must both be present.")
+    if not li_at or not jsessionid:
+        raise SystemExit("Both li_at and JSESSIONID are required.")
 
     path = session_path_for(args.account)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(cookies, f)
+        json.dump({"li_at": li_at, "JSESSIONID": jsessionid}, f)
 
-    print(f"Saved {path} ({len(cookies)} cookies)")
+    print(f"Saved {path}")
 
 
 if __name__ == "__main__":

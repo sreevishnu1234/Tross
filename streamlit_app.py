@@ -74,31 +74,27 @@ with st.expander("Login failing? Use a manually-obtained cookie instead"):
         """
 LinkedIn's login endpoint can throw up a security checkpoint on this kind of automated
 login. If that happens, one workaround is a session cookie obtained by logging in once in
-an ordinary browser (not automated by this app). **Copy the whole `Cookie` header, not just
-`li_at`/`JSESSIONID` individually** — replaying only a couple of cookies without the rest of
-the browser's original set looks like a different device reusing a stolen session token to
-LinkedIn, and gets rejected even when the values themselves are genuinely fresh:
+an ordinary browser (not automated by this app):
 
 1. Log into `linkedin.com` with the dummy account in a normal browser.
-2. DevTools (`F12`) → **Network** tab → reload `linkedin.com/feed`.
-3. Click any request to `linkedin.com` in the list → **Headers**.
-4. Find the request header named **`Cookie`** and copy its entire value (one long
-   `name=value; name=value; ...` string).
+2. DevTools (`F12`) → **Application** → **Cookies** → `https://www.linkedin.com`.
+3. Copy the **`li_at`** and **`JSESSIONID`** cookie values.
         """
     )
     with st.form("session_form"):
-        cookie_header = st.text_area("Cookie header", height=100)
+        li_at = st.text_input("li_at", type="password")
+        jsessionid = st.text_input("JSESSIONID", type="password")
         submitted = st.form_submit_button("Save Session")
 
     if submitted:
-        if not cookie_header:
-            st.error("Paste the Cookie header value first.")
+        if not li_at or not jsessionid:
+            st.error("Both li_at and JSESSIONID are required.")
         else:
             with st.spinner("Checking cookies against LinkedIn..."):
                 try:
                     resp = requests.post(
                         f"{API_URL}/session/bootstrap",
-                        json={"cookie_header": cookie_header},
+                        json={"li_at": li_at, "jsessionid": jsessionid},
                         timeout=30,
                     )
                     if resp.ok:

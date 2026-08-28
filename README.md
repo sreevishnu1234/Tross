@@ -4,6 +4,15 @@ Give it a LinkedIn profile URL, get back structured JSON. **Zero browser involve
 talks to LinkedIn's own internal REST endpoints directly over plain HTTP, the same way its
 official web/mobile clients do.
 
+## Live Deployment
+
+- **API** (Render): https://tross-hieo.onrender.com
+- **UI** (Streamlit Community Cloud): https://tross-linkden.streamlit.app/
+
+Render's free tier spins down after inactivity, so the first request after a while may take
+~30–60s to wake it back up. The UI's "1. Session" section needs a fresh login/bootstrap
+against this live API before `/profile` will return real data (see Known Limitations).
+
 ## Setup
 
 **Requires Python 3.12** (pinned in `.python-version`) — newer versions like 3.13/3.14 don't
@@ -37,6 +46,8 @@ fails on machines without a Rust/MSVC toolchain installed.
 
 ## Deployment
 
+Live at the URLs in "Live Deployment" above. To redeploy your own copy:
+
 **API** — deploy to [Render](https://render.com) as a native Python web service:
 - Set `PYTHON_VERSION` to `3.12.10` in the dashboard's environment variables.
 - Build command: `pip install -r requirements.txt`
@@ -48,7 +59,8 @@ fails on machines without a Rust/MSVC toolchain installed.
 
 **UI** — deploy `streamlit_app.py` on [Streamlit Community Cloud](https://streamlit.io/cloud)
 for free. In its advanced settings, pick Python 3.12. Set `API_URL` in its app secrets to
-your deployed API's public URL.
+your deployed API's public URL — **not** the Streamlit app's own URL (an easy mistake:
+Streamlit Cloud only hosts the UI, it can't also expose a separate callable API).
 
 ## API
 
@@ -213,6 +225,12 @@ doesn't mean it's the *right* route for the field you're after.
   "our" copy of it — `li_at` *is* the session) the instant it saw that mismatch. Switched to
   `curl_cffi` to fix this (see Approach) partway through development, so accounts flagged
   *before* that switch remain flagged — it doesn't retroactively un-flag them.
+- **`/session/bootstrap` sends only `li_at` and `JSESSIONID`, not the browser's full cookie
+  set.** A version that captured every cookie (`bcookie`, `bscookie`, etc.) was tried and
+  briefly shipped, since replaying just two cookies without the rest can itself look like a
+  different device reusing a stolen token — but it was simplified back down to two fields at
+  the account owner's explicit request, trading a small amount of robustness for a much
+  simpler UI/API surface.
 - There is no session that can be made to literally never expire — `li_at` has a real expiry
   set by LinkedIn, and LinkedIn can invalidate a session early at its own discretion. When
   that happens, the automated login is retried first; if it's checkpointed (the observed
