@@ -189,11 +189,34 @@ sets) exposed both automatically (whenever a request needs a session and none is
 on-demand via `POST /session/login` / the UI's login form. It was tested live, multiple times
 with multiple real accounts, and every attempt got checkpointed by LinkedIn's fraud system
 before a session was issued — see Known Limitations. `POST /session/bootstrap` (and the UI's
-matching fallback form) exists for exactly this case: it accepts a session cookie pair
+matching fallback form) exists for exactly this case: it accepts a `li_at`/`JSESSIONID` pair
 obtained by logging into the dummy account once in an ordinary browser — not scripted, not
-automated by this codebase — and adopts it if LinkedIn confirms it's valid. Either path
-(automated login or manual cookie) produces the same thing: a `li_at`/`JSESSIONID` pair that
-every subsequent request, including all the data-fetching calls above, uses over plain HTTP.
+automated by this codebase — and adopts it if LinkedIn confirms it's valid.
+
+**Getting a bootstrapped session to actually hold up took real trial and error.** Early
+attempts sent `li_at`/`JSESSIONID` more or less as copied and got the session revoked by
+LinkedIn on the very next request, every time (see Known Limitations for the raw evidence).
+Three things, found through direct testing, turned that into a session that reliably serves
+real data:
+
+1. **`JSESSIONID` must be sent quoted** in the `Cookie` header (`JSESSIONID="ajax:..."`) —
+   LinkedIn's own browser client always sends it that way; replaying it bare was one of the
+   things that made an otherwise-valid, freshly-issued cookie look illegitimate.
+2. **A priming `GET /feed/` before the first real API call.** Hitting the Voyager API cold, as
+   the very first request on a connection, looked automated even with valid cookies. One cheap
+   request to the feed page first fixed that.
+3. **Every call after that must reuse one persistent connection** instead of each opening a
+   new one — and the section calls (`profilePositions`, `profileEducations`, etc.) need to
+   fire *concurrently*, not one at a time with gaps between them. A slow sequential trickle of
+   requests got the session killed partway through even with everything else correct; the same
+   requests fired as a burst — matching how a real browser's page load actually looks, several
+   XHR calls firing at once rather than one-by-one — went through cleanly.
+
+`app/scraper.py` implements all three: `_get_http_session()` keeps one connection alive for
+the lifetime of a bootstrapped session, `_prime_session()` runs before anything else, and
+`scrape_profile()`'s `asyncio.gather` over the section endpoints was already concurrent by
+design — it just needed the connection-reuse and priming pieces alongside it to actually stay
+authenticated for those calls to land.
 
 ### A dead end worth noting: `profilePositionGroups`
 
@@ -215,22 +238,26 @@ doesn't mean it's the *right* route for the field you're after.
 - **LinkedIn's automated login is blocked in practice, repeatedly and consistently.** The
   credentials-based HTTP login is fully implemented and is what's attempted first, but it was
   checkpointed on every live attempt during development, across multiple different accounts
-  (including a personal one, tested once at the account owner's explicit request). Until/
-  unless that changes, most accounts will need the manual cookie fallback (`/session/
-  bootstrap` or the UI's fallback form) before the API can serve requests with them.
-- **Sessions on the accounts used during development died unusually fast**, sometimes within
-  minutes — including once logging a manually-copied cookie's *own browser tab* out
-  simultaneously. Root-caused during development: a plain Python HTTP client's TLS handshake
-  doesn't match a real browser's, and LinkedIn was revoking the session (not just blocking
-  "our" copy of it — `li_at` *is* the session) the instant it saw that mismatch. Switched to
-  `curl_cffi` to fix this (see Approach) partway through development, so accounts flagged
-  *before* that switch remain flagged — it doesn't retroactively un-flag them.
-- **`/session/bootstrap` sends only `li_at` and `JSESSIONID`, not the browser's full cookie
-  set.** A version that captured every cookie (`bcookie`, `bscookie`, etc.) was tried and
-  briefly shipped, since replaying just two cookies without the rest can itself look like a
-  different device reusing a stolen token — but it was simplified back down to two fields at
-  the account owner's explicit request, trading a small amount of robustness for a much
-  simpler UI/API surface.
+  (including a personal one, tested once at the account owner's explicit request). Every
+  account needs the manual cookie fallback (`/session/bootstrap` or the UI's fallback form) —
+  see the Login section above — before the API can serve requests with it.
+- **A bootstrapped session only stays valid for a short, specific pattern of requests, and
+  getting that pattern wrong revokes it outright — including in ways that got a real account
+  restricted and asked to submit a government ID to regain access.** Early attempts sent
+  `li_at`/`JSESSIONID` unquoted, cold (no priming request), and one call at a time from a fresh
+  connection each time; every one of those got the session revoked, and the server's own
+  response showed why:
+  ```
+  set-cookie: li_at=delete me; ...Max-Age=0...
+  clear-site-data: "storage"
+  ```
+  LinkedIn isn't silently blocking these requests — it's actively instructing the client to
+  delete the cookie, i.e. deliberately revoking the session, consistent with PerimeterX's
+  behavioral bot-detection layer. The three fixes described in the Login section above (quoted
+  `JSESSIONID`, a priming request, one persistent connection with the section calls fired
+  concurrently) resolved this and produced a session that reliably serves real data — but this
+  cost real accounts along the way to find, up to and including one full account restriction.
+  Anyone re-testing this should expect the same risk and treat it accordingly.
 - There is no session that can be made to literally never expire — `li_at` has a real expiry
   set by LinkedIn, and LinkedIn can invalidate a session early at its own discretion. When
   that happens, the automated login is retried first; if it's checkpointed (the observed

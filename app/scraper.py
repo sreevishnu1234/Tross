@@ -28,11 +28,12 @@ MONTH_NAMES = ("", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep"
 # original browser's own session!) the instant a request came in with a
 # generic Python HTTP client's TLS fingerprint, regardless of how correct
 # the headers/cookies were. This is what actually fixes that.
-IMPERSONATE = "chrome"
+IMPERSONATE = "chrome120"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+FEED_URL = "https://www.linkedin.com/feed/"
 
 CSRF_PARAM_RE = re.compile(r'name="loginCsrfParam"\s+value="([^"]*)"')
 VANITY_NAME_RE = re.compile(r"linkedin\.com/in/([a-zA-Z0-9\-_%]+)", re.IGNORECASE)
@@ -42,6 +43,13 @@ _TIMEOUT = REQUEST_TIMEOUT_MS / 1000
 _current_account_index = 0
 _cookies: "dict[str, str] | None" = None
 _lock = asyncio.Lock()
+
+# A fresh cookie only survives a handful of requests before LinkedIn's fraud
+# detection kills it — but it survives fine as long as those requests share
+# one continuous connection (like a real browser tab) instead of each
+# opening a brand-new one. This session is reused for every call made with
+# the current cookies, and reset whenever the cookies change.
+_http_session: "AsyncSession | None" = None
 
 
 def _session_path_for(index: int) -> str:
@@ -66,7 +74,17 @@ def _load_cookies(path: str) -> "dict | None":
 
 
 def _cookie_header(cookies: dict) -> str:
-    return "; ".join(f"{name}={value}" for name, value in cookies.items())
+    # LinkedIn's own browser client always sends JSESSIONID quoted
+    # (`JSESSIONID="ajax:..."`) — replaying it unquoted was found, during
+    # development, to be one of the things that made a request look
+    # illegitimate even with an otherwise-valid, freshly-issued cookie.
+    parts = []
+    for name, value in cookies.items():
+        if name == "JSESSIONID":
+            value = value.strip('"')
+            value = f'"{value}"'
+        parts.append(f"{name}={value}")
+    return "; ".join(parts)
 
 
 def _api_headers(cookies: dict) -> dict:
@@ -74,27 +92,72 @@ def _api_headers(cookies: dict) -> dict:
     return {
         "csrf-token": jsessionid,
         "x-restli-protocol-version": "2.0.0",
-        "accept": "application/json",
+        "x-li-lang": "en_US",
+        "x-li-track": '{"osName":"web","osVersion":"Windows","deviceFormFactor":"DESKTOP"}',
+        "accept": "application/vnd.linkedin.normalized+json+2.1",
+        "origin": "https://www.linkedin.com",
         "referer": "https://www.linkedin.com/",
         "user-agent": USER_AGENT,
         "cookie": _cookie_header(cookies),
     }
 
 
+async def _get_http_session() -> AsyncSession:
+    global _http_session
+    if _http_session is None:
+        _http_session = AsyncSession(impersonate=IMPERSONATE)
+    return _http_session
+
+
+async def _reset_http_session() -> None:
+    global _http_session
+    if _http_session is not None:
+        await _http_session.close()
+        _http_session = None
+
+
+async def _prime_session(cookies: dict) -> None:
+    """A real browser always loads the feed page before any API call fires
+    off it — hitting the Voyager API cold, as the very first request on a
+    connection, was found during development to itself look automated.
+    One cheap GET here fixes that."""
+    session = await _get_http_session()
+    try:
+        await session.get(
+            FEED_URL,
+            headers=_api_headers(cookies),
+            impersonate=IMPERSONATE,
+            timeout=_TIMEOUT,
+        )
+    except RequestException:
+        pass
+
+
 async def _validate_cookies(cookies: dict) -> bool:
-    """Cheap check that a saved/just-obtained cookie jar is still authenticated."""
-    async with AsyncSession() as session:
-        try:
-            resp = await session.get(
-                PROFILE_API_URL,
-                params={"q": "memberIdentity", "memberIdentity": "linkedin"},
-                headers=_api_headers(cookies),
-                impersonate=IMPERSONATE,
-                timeout=_TIMEOUT,
-            )
-        except RequestException:
-            return False
-        return resp.status_code == 200
+    """Prime the connection, then check the cookie jar is actually
+    authenticated — hitting the API cold, or on a brand-new connection each
+    time, was found during development to get the session revoked outright
+    rather than just rejected. Reuses one persistent connection so later
+    calls with these same cookies inherit a connection LinkedIn has already
+    seen behave like a normal browser tab."""
+    await _reset_http_session()
+    await _prime_session(cookies)
+    session = await _get_http_session()
+    try:
+        resp = await session.get(
+            PROFILE_API_URL,
+            params={"q": "memberIdentity", "memberIdentity": "linkedin"},
+            headers=_api_headers(cookies),
+            impersonate=IMPERSONATE,
+            timeout=_TIMEOUT,
+            allow_redirects=False,
+        )
+    except RequestException:
+        return False
+    if resp.status_code != 200:
+        await _reset_http_session()
+        return False
+    return True
 
 
 async def _login_http(username: str, password: str) -> dict:
@@ -165,6 +228,8 @@ async def _get_cookies() -> dict:
                 last_error = e
                 continue
 
+            await _reset_http_session()
+            await _prime_session(cookies)
             _save_cookies(cookies, path)
             _cookies = cookies
             _current_account_index = index
@@ -180,6 +245,7 @@ async def _drop_cookies() -> None:
         path = _session_path_for(_current_account_index)
         if os.path.exists(path):
             os.remove(path)
+    await _reset_http_session()
 
 
 async def keep_session_alive() -> None:
@@ -193,15 +259,16 @@ async def keep_session_alive() -> None:
 
 
 async def bootstrap_session(li_at: str, jsessionid: str) -> bool:
-    """Accept a manually-obtained li_at/JSESSIONID pair (see README — LinkedIn's
-    login endpoint blocks non-browser login attempts) and adopt it as the
-    active session if it actually works. Returns whether it was accepted.
+    """Accept a manually-obtained li_at/JSESSIONID pair (see README —
+    LinkedIn's login endpoint blocks non-browser login attempts) and adopt
+    it as the active session if it actually works. Returns whether it was
+    accepted.
 
-    NOTE: only these two cookies are sent, not the rest of the browser's
-    original cookie jar (bcookie/bscookie/etc.) — that was previously found to
-    look like a different device reusing a stolen session token to LinkedIn's
-    fraud detection, but was simplified back down to just these two at the
-    account owner's request. See README Known Limitations."""
+    Just these two cookies is enough, *if* the request afterward matches
+    what a real browser sends: JSESSIONID quoted in the Cookie header (see
+    _cookie_header), a priming request before the first real API call, and
+    every call after that reusing one persistent connection instead of
+    opening a new one each time (see _validate_cookies/_get_http_session)."""
     global _cookies
 
     cookies = {"li_at": li_at.strip(), "JSESSIONID": jsessionid.strip()}
@@ -223,6 +290,9 @@ async def login_with_credentials(username: str, password: str) -> None:
     global _cookies
 
     cookies = await _login_http(username.strip(), password)
+
+    await _reset_http_session()
+    await _prime_session(cookies)
 
     async with _lock:
         _save_cookies(cookies, _session_path_for(_current_account_index))
@@ -296,21 +366,29 @@ def _format_date_range(date_range: "dict | None") -> "str | None":
 
 async def _fetch_section(cookies: dict, resource: str, profile_urn: str) -> list:
     """Best-effort: a broken/rate-limited section call degrades to an empty
-    list rather than failing the whole /profile response."""
-    async with AsyncSession() as session:
-        try:
-            resp = await session.get(
-                SECTION_API_URL.format(resource=resource),
-                params={"q": "viewee", "profileUrn": profile_urn},
-                headers=_api_headers(cookies),
-                impersonate=IMPERSONATE,
-                timeout=_TIMEOUT,
-            )
-            if resp.status_code != 200:
-                return []
-            return resp.json().get("elements") or []
-        except (RequestException, ValueError):
+    list rather than failing the whole /profile response.
+
+    Fired concurrently with the other sections by scrape_profile() (via
+    asyncio.gather), on the same shared connection as the profile call
+    that precedes it — matching how a real browser fires every section's
+    XHR at once instead of one at a time. Firing these sequentially with
+    gaps between them, even with valid cookies, was found during
+    development to get the session revoked partway through."""
+    session = await _get_http_session()
+    try:
+        resp = await session.get(
+            SECTION_API_URL.format(resource=resource),
+            params={"q": "viewee", "profileUrn": profile_urn},
+            headers=_api_headers(cookies),
+            impersonate=IMPERSONATE,
+            timeout=_TIMEOUT,
+            allow_redirects=False,
+        )
+        if resp.status_code != 200:
             return []
+        return resp.json().get("elements") or []
+    except (RequestException, ValueError):
+        return []
 
 
 def _parse_education(elements: list) -> list[EducationItem]:
@@ -382,20 +460,21 @@ def _parse_languages(elements: list) -> list[str]:
 async def scrape_profile(url: str) -> ProfileResponse:
     vanity_name = _extract_vanity_name(url)
     cookies = await _get_cookies()
+    session = await _get_http_session()
 
-    async with AsyncSession() as session:
-        try:
-            resp = await session.get(
-                PROFILE_API_URL,
-                params={"q": "memberIdentity", "memberIdentity": vanity_name},
-                headers=_api_headers(cookies),
-                impersonate=IMPERSONATE,
-                timeout=_TIMEOUT,
-            )
-        except RequestException as e:
-            raise ScrapeError(f"Connection to LinkedIn failed: {e}", 502)
+    try:
+        resp = await session.get(
+            PROFILE_API_URL,
+            params={"q": "memberIdentity", "memberIdentity": vanity_name},
+            headers=_api_headers(cookies),
+            impersonate=IMPERSONATE,
+            timeout=_TIMEOUT,
+            allow_redirects=False,
+        )
+    except RequestException as e:
+        raise ScrapeError(f"Connection to LinkedIn failed: {e}", 502)
 
-    if resp.status_code in (401, 403):
+    if resp.status_code in (401, 403) or resp.status_code in (301, 302, 303, 307, 308):
         await _drop_cookies()
         raise ScrapeError(
             "Session expired, hit a security checkpoint, or got rate-limited. "
