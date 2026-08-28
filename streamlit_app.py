@@ -9,121 +9,41 @@ st.title("LinkedIn Profile API")
 st.caption("Paste a LinkedIn profile URL, get back structured JSON — pure HTTP calls to "
            "LinkedIn's own API, no browser involved.")
 
-# --- Step 1: session bootstrap -------------------------------------------------
-st.header("1. Session")
+# --- Primary flow: cookie + URL in one shot -------------------------------------
+st.header("Look up a profile")
+st.caption(
+    "Paste a fresh `li_at`/`JSESSIONID` (DevTools → Application → Cookies → "
+    "linkedin.com, from a normal browser login) together with the profile URL, and "
+    "click once. Session setup and the lookup happen back-to-back in one request — "
+    "LinkedIn's session checks were found, during development, to be sensitive to any "
+    "gap between those two steps, so doing them separately is less reliable than this."
+)
 
-try:
-    status = requests.get(f"{API_URL}/session/status", timeout=10).json()
-    session_configured = status.get("configured", False)
-except requests.RequestException:
-    session_configured = None
+with st.form("bootstrap_and_scrape_form"):
+    li_at = st.text_input("li_at", type="password")
+    jsessionid = st.text_input("JSESSIONID", type="password")
+    url = st.text_input("LinkedIn profile URL", placeholder="https://www.linkedin.com/in/some-person/")
+    go_submitted = st.form_submit_button("Get Profile")
 
-if session_configured:
-    st.success("A session is saved and ready to use.")
-elif session_configured is False:
-    st.warning("No session saved yet — log in below to get started.")
-else:
-    st.error(f"Couldn't reach the API at {API_URL}.")
-
-st.subheader("Option 1 — Auto-login using .env")
-st.caption("Tries the first account in .env's LINKEDIN_ACCOUNTS via LinkedIn's own HTTP API "
-           "(no browser). Nothing to type — just click and see whether it passed or failed.")
-
-if st.button("Try Auto-Login"):
-    with st.spinner("Logging in via LinkedIn's API..."):
-        try:
-            resp = requests.post(f"{API_URL}/session/auto-login", timeout=30)
-            if resp.ok:
-                st.success(f"✅ Passed — logged in as {resp.json().get('username')}.")
-                st.rerun()
-            else:
-                st.error(f"❌ Failed — {resp.json().get('error', 'Login failed.')}")
-        except requests.RequestException as e:
-            st.error(f"❌ Couldn't reach the API: {e}")
-
-st.subheader("Option 2 — Manual login or cookie")
-st.caption("Type different credentials directly (doesn't touch .env), or fall back to a "
-           "manually-obtained cookie if login keeps getting checkpointed.")
-
-with st.form("login_form"):
-    username = st.text_input("Email", placeholder="you@example.com")
-    password = st.text_input("Password", type="password", placeholder="••••••••")
-    login_submitted = st.form_submit_button("Log In")
-
-if login_submitted:
-    if not username or not password:
-        st.error("Both email and password are required.")
+if go_submitted:
+    if not li_at or not jsessionid or not url:
+        st.error("li_at, JSESSIONID, and the profile URL are all required.")
     else:
-        with st.spinner("Logging in via LinkedIn's API..."):
+        with st.spinner("Logging in and scraping..."):
             try:
                 resp = requests.post(
-                    f"{API_URL}/session/login",
-                    json={"username": username, "password": password},
-                    timeout=30,
+                    f"{API_URL}/session/bootstrap-and-scrape",
+                    json={"li_at": li_at, "jsessionid": jsessionid, "url": url},
+                    timeout=90,
                 )
                 if resp.ok:
-                    st.success("Logged in — you're ready to look up profiles.")
-                    st.rerun()
+                    st.session_state["profile"] = resp.json()
                 else:
-                    st.error(resp.json().get("error", "Login failed."))
+                    st.session_state.pop("profile", None)
+                    st.error(resp.json().get("error", "Something went wrong."))
             except requests.RequestException as e:
-                st.error(f"Couldn't reach the API: {e}")
-
-with st.expander("Login failing? Use a manually-obtained cookie instead"):
-    st.markdown(
-        """
-LinkedIn's login endpoint can throw up a security checkpoint on this kind of automated
-login. If that happens, one workaround is a session cookie obtained by logging in once in
-an ordinary browser (not automated by this app):
-
-1. Log into `linkedin.com` with the dummy account in a normal browser.
-2. DevTools (`F12`) → **Application** → **Cookies** → `https://www.linkedin.com`.
-3. Copy the **`li_at`** and **`JSESSIONID`** cookie values.
-        """
-    )
-    with st.form("session_form"):
-        li_at = st.text_input("li_at", type="password")
-        jsessionid = st.text_input("JSESSIONID", type="password")
-        submitted = st.form_submit_button("Save Session")
-
-    if submitted:
-        if not li_at or not jsessionid:
-            st.error("Both li_at and JSESSIONID are required.")
-        else:
-            with st.spinner("Checking cookies against LinkedIn..."):
-                try:
-                    resp = requests.post(
-                        f"{API_URL}/session/bootstrap",
-                        json={"li_at": li_at, "jsessionid": jsessionid},
-                        timeout=30,
-                    )
-                    if resp.ok:
-                        st.success("Session saved — you're ready to look up profiles.")
-                        st.rerun()
-                    else:
-                        st.error(resp.json().get("error", "Those cookies didn't work."))
-                except requests.RequestException as e:
-                    st.error(f"Couldn't reach the API: {e}")
-
-st.divider()
-
-# --- Step 2: profile lookup -----------------------------------------------------
-st.header("2. Look up a profile")
-
-url = st.text_input("LinkedIn profile URL", placeholder="https://www.linkedin.com/in/some-person/")
-
-if st.button("Get Profile") and url:
-    with st.spinner("Scraping..."):
-        try:
-            response = requests.post(f"{API_URL}/profile", json={"url": url}, timeout=90)
-            if response.ok:
-                st.session_state["profile"] = response.json()
-            else:
                 st.session_state.pop("profile", None)
-                st.error(response.json().get("error", "Something went wrong."))
-        except requests.RequestException as e:
-            st.session_state.pop("profile", None)
-            st.error(f"Couldn't reach the API: {e}")
+                st.error(f"Couldn't reach the API: {e}")
 
 profile = st.session_state.get("profile")
 if profile:
@@ -179,3 +99,83 @@ if profile:
         if profile.get("languages"):
             st.markdown("### Languages")
             st.write(", ".join(profile["languages"]))
+
+st.divider()
+
+# --- Advanced: separate session setup, for automated/credential login ----------
+with st.expander("Advanced: set up a session separately (credential login, or reuse a saved session)"):
+    try:
+        status = requests.get(f"{API_URL}/session/status", timeout=10).json()
+        session_configured = status.get("configured", False)
+    except requests.RequestException:
+        session_configured = None
+
+    if session_configured:
+        st.success("A session is saved and ready to use.")
+    elif session_configured is False:
+        st.warning("No session saved yet.")
+    else:
+        st.error(f"Couldn't reach the API at {API_URL}.")
+
+    st.caption(
+        "Tries the first account in .env's LINKEDIN_ACCOUNTS via LinkedIn's own HTTP API "
+        "(no browser). This is expected to get checkpointed in practice — see README."
+    )
+    if st.button("Try Auto-Login"):
+        with st.spinner("Logging in via LinkedIn's API..."):
+            try:
+                resp = requests.post(f"{API_URL}/session/auto-login", timeout=30)
+                if resp.ok:
+                    st.success(f"✅ Passed — logged in as {resp.json().get('username')}.")
+                else:
+                    st.error(f"❌ Failed — {resp.json().get('error', 'Login failed.')}")
+            except requests.RequestException as e:
+                st.error(f"❌ Couldn't reach the API: {e}")
+
+    st.caption("Or log in with different credentials directly (doesn't touch .env):")
+    with st.form("login_form"):
+        username = st.text_input("Email", placeholder="you@example.com")
+        password = st.text_input("Password", type="password", placeholder="••••••••")
+        login_submitted = st.form_submit_button("Log In")
+
+    if login_submitted:
+        if not username or not password:
+            st.error("Both email and password are required.")
+        else:
+            with st.spinner("Logging in via LinkedIn's API..."):
+                try:
+                    resp = requests.post(
+                        f"{API_URL}/session/login",
+                        json={"username": username, "password": password},
+                        timeout=30,
+                    )
+                    if resp.ok:
+                        st.success("Logged in — the saved session will be reused by /profile.")
+                    else:
+                        st.error(resp.json().get("error", "Login failed."))
+                except requests.RequestException as e:
+                    st.error(f"Couldn't reach the API: {e}")
+
+    st.caption("Or save a session from a manually-obtained cookie, to reuse later without repasting it:")
+    with st.form("session_form"):
+        saved_li_at = st.text_input("li_at ", type="password")
+        saved_jsessionid = st.text_input("JSESSIONID ", type="password")
+        session_submitted = st.form_submit_button("Save Session")
+
+    if session_submitted:
+        if not saved_li_at or not saved_jsessionid:
+            st.error("Both li_at and JSESSIONID are required.")
+        else:
+            with st.spinner("Checking cookies against LinkedIn..."):
+                try:
+                    resp = requests.post(
+                        f"{API_URL}/session/bootstrap",
+                        json={"li_at": saved_li_at, "jsessionid": saved_jsessionid},
+                        timeout=30,
+                    )
+                    if resp.ok:
+                        st.success("Session saved — the next /profile call will reuse it.")
+                    else:
+                        st.error(resp.json().get("error", "Those cookies didn't work."))
+                except requests.RequestException as e:
+                    st.error(f"Couldn't reach the API: {e}")

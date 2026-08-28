@@ -4,14 +4,19 @@ Give it a LinkedIn profile URL, get back structured JSON. **Zero browser involve
 talks to LinkedIn's own internal REST endpoints directly over plain HTTP, the same way its
 official web/mobile clients do.
 
+**Confirmed working end-to-end**, including login/session, against live LinkedIn data — not
+just in isolated tests, through the actual deployed UI. See Login and Known Limitations below
+for exactly what that took and how fragile it still is by nature of what LinkedIn actively
+does to prevent it.
+
 ## Live Deployment
 
 - **API** (Render): https://tross-hieo.onrender.com
 - **UI** (Streamlit Community Cloud): https://tross-linkden.streamlit.app/
 
 Render's free tier spins down after inactivity, so the first request after a while may take
-~30–60s to wake it back up. The UI's "1. Session" section needs a fresh login/bootstrap
-against this live API before `/profile` will return real data (see Known Limitations).
+~30–60s to wake it back up. The UI's single form (`li_at` + `JSESSIONID` + profile URL) needs
+a fresh cookie pair from a real browser login each time — see Login and Known Limitations.
 
 ## Setup
 
@@ -34,15 +39,16 @@ fails on machines without a Rust/MSVC toolchain installed.
    ```bash
    streamlit run streamlit_app.py
    ```
-   Set `API_URL` if the API isn't running on `http://127.0.0.1:8000`. Open the UI and use the
-   **"1. Session"** section to log in with a throwaway/dummy account's email + password —
-   not your personal account. This calls the API's own `/session/login`, which authenticates
-   directly against LinkedIn over plain HTTP (see Approach). If LinkedIn checkpoints that
-   login (a real, observed possibility — see Known Limitations), the same section has a
-   fallback: log into the dummy account once in an ordinary browser and paste its `li_at` /
-   `JSESSIONID` cookie values in instead. Either path saves `session_state.json`, which the
-   API reuses on every subsequent request and restart. **Treat this file like a live
-   password — it's gitignored, and must never be committed or shared.**
+   Set `API_URL` if the API isn't running on `http://127.0.0.1:8000`. Open the UI: the main
+   form asks for `li_at`, `JSESSIONID`, and a profile URL together, and does the whole flow —
+   session setup and the lookup — in one request (see Login for why these are combined rather
+   than being two separate steps). Get the cookie values by logging into the account in an
+   ordinary browser, then DevTools → Application → Cookies → `https://www.linkedin.com`. An
+   "Advanced" section below it exposes automated credential login and a session-only bootstrap
+   separately, for anyone who wants to reuse one saved session across multiple lookups instead
+   — that path saves `session_state.json`, which the API reuses on every subsequent request
+   and restart. **Treat that file like a live password — it's gitignored, and must never be
+   committed or shared.**
 
 ## Deployment
 
@@ -54,8 +60,8 @@ Live at the URLs in "Live Deployment" above. To redeploy your own copy:
 - Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
 - Set `LINKEDIN_ACCOUNTS` as an environment variable in the dashboard (placeholder values are
   fine — see Setup) — never real credentials in the repo.
-- Log in once against the deployed instance via the UI's "1. Session" section (point its
-  `API_URL` at the deployed API first) so it has a working `session_state.json`.
+- Bootstrap a session against the deployed instance via the UI's main form or the "Advanced"
+  section (point its `API_URL` at the deployed API first) to give it a working session.
 
 **UI** — deploy `streamlit_app.py` on [Streamlit Community Cloud](https://streamlit.io/cloud)
 for free. In its advanced settings, pick Python 3.12. Set `API_URL` in its app secrets to
@@ -87,7 +93,23 @@ by logging into the dummy account once in an ordinary browser (see Setup).
 ```
 `200` if the cookies check out against LinkedIn, `401` if they don't.
 
+### `POST /session/bootstrap-and-scrape` — the recommended way to call this API
+
+Does session bootstrap and a profile lookup as one continuous back-to-back request sequence
+server-side, instead of two separate calls with an unpredictable gap between them. This is the
+form the UI leads with, and the one that's actually been confirmed working end-to-end — see
+Login for why the gap between "save session" and "look up a profile" matters here.
+```json
+{ "li_at": "...", "jsessionid": "...", "url": "https://www.linkedin.com/in/some-person/" }
+```
+Returns the same `ProfileResponse` shape as `/profile` below on success.
+
 ### `POST /profile`
+
+Uses whatever session is already saved (from `/session/login`, `/session/bootstrap`, or a
+previous `/session/bootstrap-and-scrape` call) rather than taking a cookie directly — prefer
+`/session/bootstrap-and-scrape` unless you specifically need to reuse an existing session
+across multiple profile lookups.
 
 **Request**
 ```json
@@ -218,6 +240,23 @@ the lifetime of a bootstrapped session, `_prime_session()` runs before anything 
 design — it just needed the connection-reuse and priming pieces alongside it to actually stay
 authenticated for those calls to land.
 
+### A second bug the first one was hiding: wrong JSON key entirely
+
+Once the session actually authenticated, requests still came back reporting "profile is
+private, restricted, or doesn't exist" — even for known-public profiles, with a clean `200`
+from LinkedIn. The cause turned out to be unrelated to sessions at all: every endpoint under
+`voyager/api/identity/dash/` wraps its response as a RestLI `CollectionResponse` —
+```json
+{ "data": { "*elements": ["urn:li:fsd_profile:..."] }, "included": [ { "entityUrn": "urn:li:fsd_profile:...", "...": "..." } ] }
+```
+— where the real objects live in the flat `included` array, referenced by URN via
+`data["data"]["*elements"]`. The parsing code had been reading a top-level `elements` key that
+never existed in this response shape, so it silently returned nothing regardless of whether
+the request actually succeeded. This bug predates all of the session work above — it just
+never surfaced, because no session survived long enough to reach this code path until the
+fixes above were in place. `_collection_elements()` in `app/scraper.py` resolves this
+correctly now, used by both the profile call and every section call.
+
 ### A dead end worth noting: `profilePositionGroups`
 
 Before finding `profilePositions`, this project also found (and initially shipped)
@@ -235,12 +274,12 @@ doesn't mean it's the *right* route for the field you're after.
 - `location` is only a country code (e.g. `"IN"`) — the endpoint used here doesn't expose a
   readable city/region string, and resolving the `geoUrn` it does return to one would need a
   second endpoint that wasn't identified.
-- **LinkedIn's automated login is blocked in practice, repeatedly and consistently.** The
-  credentials-based HTTP login is fully implemented and is what's attempted first, but it was
+- **LinkedIn's automated (credentials-based) login is blocked in practice, repeatedly and
+  consistently.** It's fully implemented and is what's attempted first, but it was
   checkpointed on every live attempt during development, across multiple different accounts
   (including a personal one, tested once at the account owner's explicit request). Every
-  account needs the manual cookie fallback (`/session/bootstrap` or the UI's fallback form) —
-  see the Login section above — before the API can serve requests with it.
+  account needs the manual cookie flow (`/session/bootstrap-and-scrape`, or `/session/
+  bootstrap` — see the Login section above) instead — this path is the one confirmed working.
 - **A bootstrapped session only stays valid for a short, specific pattern of requests, and
   getting that pattern wrong revokes it outright — including in ways that got a real account
   restricted and asked to submit a government ID to regain access.** Early attempts sent
@@ -253,11 +292,23 @@ doesn't mean it's the *right* route for the field you're after.
   ```
   LinkedIn isn't silently blocking these requests — it's actively instructing the client to
   delete the cookie, i.e. deliberately revoking the session, consistent with PerimeterX's
-  behavioral bot-detection layer. The three fixes described in the Login section above (quoted
+  behavioral bot-detection layer. The three fixes in the Login section above (quoted
   `JSESSIONID`, a priming request, one persistent connection with the section calls fired
-  concurrently) resolved this and produced a session that reliably serves real data — but this
-  cost real accounts along the way to find, up to and including one full account restriction.
-  Anyone re-testing this should expect the same risk and treat it accordingly.
+  concurrently) resolved this and were confirmed, live, to produce a session that serves real
+  data end-to-end through the actual deployed UI — but this cost real accounts along the way
+  to find, up to and including one full account restriction. A session bootstrapped this way
+  still only survives a handful of requests before LinkedIn's fraud detection catches up to
+  it, which is why `/session/bootstrap-and-scrape` (cookie + profile URL together, one call)
+  is the recommended endpoint over bootstrapping and looking up a profile as two separate
+  steps — anything that introduces a gap between them reintroduces the risk of revocation.
+  Anyone re-testing this should expect the same risk and treat it accordingly — testing this
+  project's own fixes is what triggered the account restriction described above.
+- **A verified account appears to survive this better than a brand-new or already-flagged
+  one.** Every fresh/dummy account tried during development got flagged or restricted
+  quickly; the account that finally produced a clean, repeatable, working result was one with
+  an established identity-verification history. Not conclusively proven, but consistent with
+  everything observed — LinkedIn's fraud system plausibly trusts a verified account's session
+  more than a brand-new one's, independent of anything this codebase does differently.
 - There is no session that can be made to literally never expire — `li_at` has a real expiry
   set by LinkedIn, and LinkedIn can invalidate a session early at its own discretion. When
   that happens, the automated login is retried first; if it's checkpointed (the observed

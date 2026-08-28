@@ -8,9 +8,16 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from app.config import KEEP_ALIVE_INTERVAL_SECONDS, LINKEDIN_ACCOUNTS, RATE_LIMIT_PER_MINUTE
-from app.schema import BootstrapRequest, LoginRequest, ProfileRequest, ProfileResponse
+from app.schema import (
+    BootstrapAndScrapeRequest,
+    BootstrapRequest,
+    LoginRequest,
+    ProfileRequest,
+    ProfileResponse,
+)
 from app.scraper import (
     ScrapeError,
+    bootstrap_and_scrape,
     bootstrap_session,
     has_saved_session,
     keep_session_alive,
@@ -77,6 +84,24 @@ async def session_bootstrap(body: BootstrapRequest):
             detail="Those cookies don't look valid — double-check them and try again.",
         )
     return {"status": "ok"}
+
+
+@app.post("/session/bootstrap-and-scrape", response_model=ProfileResponse)
+async def session_bootstrap_and_scrape(body: BootstrapAndScrapeRequest, request: Request):
+    """One-shot version of bootstrap + profile lookup, done as a single
+    back-to-back request sequence server-side instead of two separate UI
+    actions with an unpredictable gap between them — see README."""
+    client_ip = request.client.host if request.client else "unknown"
+    if _rate_limited(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests, slow down.")
+
+    try:
+        return await bootstrap_and_scrape(body.li_at, body.jsessionid, body.url)
+    except ScrapeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
+    except Exception:
+        logger.exception("Unhandled error in bootstrap-and-scrape for %s", body.url)
+        raise HTTPException(status_code=500, detail="Failed to scrape the profile.")
 
 
 @app.post("/session/login")

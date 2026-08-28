@@ -282,6 +282,32 @@ async def bootstrap_session(li_at: str, jsessionid: str) -> bool:
     return True
 
 
+async def bootstrap_and_scrape(li_at: str, jsessionid: str, url: str) -> ProfileResponse:
+    """Combined one-shot version of bootstrap_session() + scrape_profile().
+
+    A bootstrap-then-separately-scrape flow, done as two UI actions with an
+    unpredictable human-paced gap in between, doesn't match the tight,
+    back-to-back request pattern that was actually confirmed to work (see
+    README — Login). This skips the separate validation call bootstrap_
+    session() makes (one less request spent before the part that matters)
+    and goes straight from priming to the real profile fetch, so the whole
+    sequence happens in one continuous burst every time."""
+    global _cookies
+
+    cookies = {"li_at": li_at.strip(), "JSESSIONID": jsessionid.strip()}
+
+    await _reset_http_session()
+    await _prime_session(cookies)
+
+    result = await scrape_profile(url, cookies=cookies)
+
+    async with _lock:
+        _save_cookies(cookies, _session_path_for(_current_account_index))
+        _cookies = cookies
+
+    return result
+
+
 async def login_with_credentials(username: str, password: str) -> None:
     """On-demand version of the same pure-HTTP login _get_cookies() falls back
     to automatically — lets the UI trigger a login with a specific account
@@ -303,6 +329,22 @@ def has_saved_session() -> bool:
     """Cheap, non-network check of whether a session file exists for the
     currently active account — doesn't confirm it's still valid."""
     return os.path.exists(_session_path_for(_current_account_index))
+
+
+def _collection_elements(data: dict) -> list[dict]:
+    """Every endpoint under voyager/api/identity/dash/ returns a RestLI
+    CollectionResponse: {"data": {"*elements": [urn, ...]}, "included": [...]}
+    — the ordered list of URNs in data["data"]["*elements"] references full
+    objects living in the flat "included" array, not a top-level "elements"
+    key. Resolve them back into the objects the rest of this module expects."""
+    urns = ((data.get("data") or {}).get("*elements")) or []
+    included = data.get("included") or []
+    by_urn = {}
+    for item in included:
+        urn = item.get("entityUrn")
+        if urn and urn not in by_urn:
+            by_urn[urn] = item
+    return [by_urn[urn] for urn in urns if urn in by_urn]
 
 
 def _extract_vanity_name(url: str) -> str:
@@ -386,7 +428,7 @@ async def _fetch_section(cookies: dict, resource: str, profile_urn: str) -> list
         )
         if resp.status_code != 200:
             return []
-        return resp.json().get("elements") or []
+        return _collection_elements(resp.json())
     except (RequestException, ValueError):
         return []
 
@@ -457,9 +499,10 @@ def _parse_languages(elements: list) -> list[str]:
     return result
 
 
-async def scrape_profile(url: str) -> ProfileResponse:
+async def scrape_profile(url: str, cookies: "dict | None" = None) -> ProfileResponse:
     vanity_name = _extract_vanity_name(url)
-    cookies = await _get_cookies()
+    if cookies is None:
+        cookies = await _get_cookies()
     session = await _get_http_session()
 
     try:
@@ -489,7 +532,7 @@ async def scrape_profile(url: str) -> ProfileResponse:
     except ValueError:
         raise ScrapeError("LinkedIn returned a response that wasn't valid JSON.", 502)
 
-    elements = data.get("elements") or []
+    elements = _collection_elements(data)
     if not elements:
         raise ScrapeError("Profile is private, restricted, or doesn't exist.", 404)
 

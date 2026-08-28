@@ -60,6 +60,23 @@ class BootstrapRequest(BaseModel):
     jsessionid: str
 
 
+class BootstrapAndScrapeRequest(BaseModel):
+    li_at: str
+    jsessionid: str
+    url: str
+
+    @field_validator("url")
+    @classmethod
+    def validate_linkedin_url(cls, value: str) -> str:
+        value = value.strip()
+        if not LINKEDIN_PROFILE_URL_RE.match(value):
+            raise ValueError(
+                "url must be a valid LinkedIn profile URL, e.g. "
+                "https://www.linkedin.com/in/some-person/"
+            )
+        return value
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
