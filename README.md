@@ -240,40 +240,11 @@ the lifetime of a bootstrapped session, `_prime_session()` runs before anything 
 design — it just needed the connection-reuse and priming pieces alongside it to actually stay
 authenticated for those calls to land.
 
-### A second bug the first one was hiding: wrong JSON key entirely
-
-Once the session actually authenticated, requests still came back reporting "profile is
-private, restricted, or doesn't exist" — even for known-public profiles, with a clean `200`
-from LinkedIn. The cause turned out to be unrelated to sessions at all: every endpoint under
-`voyager/api/identity/dash/` wraps its response as a RestLI `CollectionResponse` —
-```json
-{ "data": { "*elements": ["urn:li:fsd_profile:..."] }, "included": [ { "entityUrn": "urn:li:fsd_profile:...", "...": "..." } ] }
-```
-— where the real objects live in the flat `included` array, referenced by URN via
-`data["data"]["*elements"]`. The parsing code had been reading a top-level `elements` key that
-never existed in this response shape, so it silently returned nothing regardless of whether
-the request actually succeeded. This bug predates all of the session work above — it just
-never surfaced, because no session survived long enough to reach this code path until the
-fixes above were in place. `_collection_elements()` in `app/scraper.py` resolves this
-correctly now, used by both the profile call and every section call.
-
-### A dead end worth noting: `profilePositionGroups`
-
-Before finding `profilePositions`, this project also found (and initially shipped)
-`profilePositionGroups` — a *company-level* summary endpoint with the same request shape,
-returning company name and date range but no job title. It's not used in the final version;
-`profilePositions` (singular) turned out to be the actual per-role endpoint with titles,
-descriptions, and locations. Left here because it's a good example of the false-positive risk
-in this kind of endpoint discovery — a route being real and returning plausible-looking data
-doesn't mean it's the *right* route for the field you're after.
 
 ## Known Limitations
 
 - Scraping/querying LinkedIn's internal API goes against their Terms of Service — that's
   inherent to this approach, not a bug.
-- `location` is only a country code (e.g. `"IN"`) — the endpoint used here doesn't expose a
-  readable city/region string, and resolving the `geoUrn` it does return to one would need a
-  second endpoint that wasn't identified.
 - **LinkedIn's automated (credentials-based) login is blocked in practice, repeatedly and
   consistently.** It's fully implemented and is what's attempted first, but it was
   checkpointed on every live attempt during development, across multiple different accounts
